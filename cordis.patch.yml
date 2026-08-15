@@ -1,0 +1,12 @@
+# dsh-rokid-aiui bundle patch — the layer applied when a profile lists this bundle.
+
+# Optional configuration (override in your profile's cordis.patch.yml by id):
+#   - id: aiui-dev-console
+#     config:
+#       workspaceRoot: 'E:/path/to/your/aiui/projects'   # scanned for app.json dirs
+#       projectFile:  'E:/path/to/current-project.json'  # marker file for the chosen project
+#       aixCli:       'E:/path/to/aix-cli/dist/cli.js'   # override the resolved aix-cli entry
+#       aixCwd:       'E:/path'                          # spawn cwd for the preview dev server
+- insert:
+    - id: aiui-dev-console
+      name: 'dsh-rokid-aiui'

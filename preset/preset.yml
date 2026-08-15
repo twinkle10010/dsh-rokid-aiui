@@ -1,0 +1,3 @@
+name: AIUI 开发模式
+description: 面向 Rokid AIUI（Ink 框架）应用的开发模式：内置 aiui-dev 技能与 AIUI 开发控制台，进入后先选择项目，再用官方 aix preview（真实 Ink 浏览器运行时）实时渲染预览。
+order: 5

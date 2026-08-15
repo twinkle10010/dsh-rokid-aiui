@@ -1,0 +1,38 @@
+{
+  "name": "dsh-rokid-aiui",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness host plugin: an AIUI dev console with a live aix preview (hot-reload) and a project file tree.",
+  "type": "module",
+  "main": "lib/aiui-dev-console.js",
+  "exports": {
+    ".": "./lib/aiui-dev-console.js"
+  },
+  "files": [
+    "lib",
+    "src",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "@yodaos-pkg/aix-cli": "^0.8.2"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "aiui",
+    "aix",
+    "preview"
+  ],
+  "license": "MIT"
+}
