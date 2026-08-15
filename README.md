@@ -24,6 +24,27 @@ dsh-rokid-aiui/
 - 已安装 DeepSeek Harness 的 `dsh` CLI
 - Node ≥ 20
 
+## AI 自动安装清单
+
+> 给 AI 助手看的完整流程。用户说「帮我安装 dsh-rokid-aiui」时，按顺序执行，不要跳过。`<name>` 是用户的 profile 名（通常 `web`）。
+
+**AI 自动执行：**
+
+1. 检查 CLI：`dsh --version`（源码版用 `pnpm dsh --version`）。失败就停下，先让用户装好 dsh。
+2. 拉取本仓库（为了拿到 `preset/`）：`git clone https://github.com/twinkle10010/dsh-rokid-aiui`
+3. 安装插件：`dsh plugin --profile <name> add github:twinkle10010/dsh-rokid-aiui`
+4. 复制预设到 Harness home（按平台二选一）：
+   - Windows PowerShell：`Copy-Item -Recurse dsh-rokid-aiui\preset "$HOME\.dsh\.agent-presets\aiui-dev"`
+   - Linux / macOS：`cp -r dsh-rokid-aiui/preset "$HOME/.dsh/.agent-presets/aiui-dev"`
+5. 下载 skill（命令见下文「下载 aiui-dev skill」），完成后确认 `~/.dsh/.agent-presets/aiui-dev/skills/aiui-dev/SKILL.md` 存在。
+
+**AI 做不了、必须提示用户的两步：**
+
+6. **重启 dsh**（插件要重启才生效）。
+7. **新建会话并选择「AIUI 开发模式」预设**。
+
+完成后这样回复用户：`装好了。请重启 dsh，然后新建一个会话选「AIUI 开发模式」，进入后选项目即可看到实时预览。`
+
 ## 1. 安装插件
 
 三种方式任选其一（`<name>` 换成你的 profile 名，例如 `web`）：
@@ -92,14 +113,17 @@ rm -rf /tmp/AIUI
     presetId: 'aiui-dev'
 ```
 
-## 使用
+## 使用流程
 
-1. 新建会话 → 选择「AIUI 开发模式」预设。
-2. 左下角出现按钮、右侧出现项目面板；首次会弹「选择 AIUI 项目」。
-3. 选一个含 `app.json` 的项目 → 右侧加载文件树，preview 窗即时渲染。
-4. 改代码保存 → 预览自动热更新。
+1. **重启 dsh**（装完插件后第一次必须重启）。
+2. **新建会话** → 选择「AIUI 开发模式」预设。
+3. 进入后，左下角出现「AIUI 开发模式」按钮、右侧出现项目面板；若尚未选过项目，会自动弹出「选择 AIUI 项目」对话框。
+4. **选项目**：从候选列表选，或用「浏览文件夹…」选任意含 `app.json` 的目录。
+5. 选完后：右侧加载文件树；点左下角按钮打开预览窗，实时渲染该项目。
+6. **开发**：改项目里的 `.ink` / WXML / WXSS / JS，保存后预览自动热更新，无需手动刷新。
+7. **切换项目**：点右侧面板「选择项目」重选（或让 agent 重写标记文件后刷新页面），预览服务自动重启指向新项目。
 
-> 切换项目：点右侧面板「选择项目」重选（或重写标记文件后刷新页面），预览服务自动重启指向新项目。
+> 项目标记：默认存于 `<workspaceRoot>/.aiui/current-project.json`，记录「当前项目」；换项目就是换这个文件的内容。
 
 ## 开发 / 重新构建
 

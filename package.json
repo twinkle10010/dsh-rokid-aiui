@@ -11,7 +11,8 @@
     "lib",
     "src",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "preset"
   ],
   "dsh": {
     "bundle": {
