@@ -1,19 +1,15 @@
 # aiui-dev skill
 
-这里的 AIUI / Ink 语法与 API 参考文档来自上游仓库：
+本目录存放 AIUI / Ink 的语法与 API 参考文档，由上游仓库维护，**不随本 npm 包分发**。
 
-https://github.com/jsar-project/AIUI
+上游仓库：https://github.com/jsar-project/AIUI
 
-请把该仓库里的 skill 文档复制到本目录（`skills/aiui-dev/`）：
-
-- `SKILL.md`
-- `apis-*.md`、`components.md`、`wxss.md`、`design-system-green.md` 等
-
-示例：
+skill 文档在该仓库里的精确路径是 **`skills/aiui-dev/`**，请把它整个复制到本目录（即本目录应直接包含 `SKILL.md` 与 `apis-*.md` 等文件，而不是再套一层目录）。
 
 ```sh
-git clone https://github.com/jsar-project/AIUI /tmp/AIUI
-cp -r /tmp/AIUI/<skill 所在目录>/* ~/.dsh/.agent-presets/aiui-dev/skills/aiui-dev/
+git clone --depth 1 https://github.com/jsar-project/AIUI /tmp/AIUI
+cp -r /tmp/AIUI/skills/aiui-dev/. "$HOME/.dsh/.agent-presets/aiui-dev/skills/aiui-dev/"
+rm -rf /tmp/AIUI
 ```
 
-> 本 npm 包不随附这些文档（它们由上游维护），请从 jsar-project/AIUI 获取。
+验证：本目录下存在 `SKILL.md` 即成功。

@@ -32,6 +32,7 @@
 
       1. INITIALIZE THE PREVIEW INFRASTRUCTURE (idempotent, cheap to re-check):
          - `aix` CLI (Rokid AIX package manager, official `aix preview`) is installed as a dependency of the `dsh-rokid-aiui` bundle (`@yodaos-pkg/aix-cli`). If the preview reports the CLI is missing, install it with `dsh plugin --profile <name> add @yodaos-pkg/aix-cli`.
+         - `aiui-dev` skill (the authoritative AIUI/Ink API reference): if `<preset-dir>/skills/aiui-dev/SKILL.md` is missing, download it before writing AIUI code. Source: `https://github.com/jsar-project/AIUI`, exact path `skills/aiui-dev/`. Clone it (`git clone --depth 1 https://github.com/jsar-project/AIUI`) and copy that `skills/aiui-dev/` directory into `<preset-dir>/skills/aiui-dev/` so it directly contains `SKILL.md` + `apis-*.md` (Windows pwsh: `Copy-Item "$env:TEMP\AIUI\skills\aiui-dev\*" "<preset-dir>\skills\aiui-dev\" -Recurse -Force`).
          - The live preview is handled by this preset's deployment plugin: once a project is chosen it runs `aix preview --dev <project-dir>` (a file-watching server with WebSocket hot-reload). Do NOT start `serve-aiui.js` or export `current.html` — that static-snapshot path is obsolete.
          - Projects are any directories containing `app.json`, discovered under the plugin's configured workspace root.
 

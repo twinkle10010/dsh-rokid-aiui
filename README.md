@@ -54,17 +54,27 @@ cp -r preset "$HOME/.dsh/.agent-presets/aiui-dev"
 Copy-Item -Recurse preset "$HOME\.dsh\.agent-presets\aiui-dev"
 ```
 
-### 下载 aiui-dev skill
+### 下载 aiui-dev skill（必做，否则 skill 缺失）
 
-`preset/skills/aiui-dev/` 里的 AIUI API 参考文档来自 [jsar-project/AIUI](https://github.com/jsar-project/AIUI)：
+AIUI/Ink 的 API 参考文档**不随本仓库分发**，需要从上游 [jsar-project/AIUI](https://github.com/jsar-project/AIUI) 下载。该仓库里 skill 的**精确路径是 `skills/aiui-dev/`**（含 `SKILL.md`、`apis-*.md`、`components.md`、`wxss.md`、`design-system-green.md`），把它整个复制到预设的 `skills/aiui-dev/` 下即可。
 
-```sh
-git clone https://github.com/jsar-project/AIUI
-# 把该仓库里的 skill 文档（SKILL.md + apis-*.md / components.md / wxss.md 等）复制到
-# ~/.dsh/.agent-presets/aiui-dev/skills/aiui-dev/
+**Windows (PowerShell)**
+```powershell
+git clone --depth 1 https://github.com/jsar-project/AIUI "$env:TEMP\AIUI"
+New-Item -ItemType Directory -Force "$HOME\.dsh\.agent-presets\aiui-dev\skills\aiui-dev" | Out-Null
+Copy-Item "$env:TEMP\AIUI\skills\aiui-dev\*" "$HOME\.dsh\.agent-presets\aiui-dev\skills\aiui-dev\" -Recurse -Force
+Remove-Item "$env:TEMP\AIUI" -Recurse -Force
 ```
 
-（skill 是给 agent 的 AIUI/Ink 语法与 API 权威参考，不随本 npm 包分发，需从上游仓库取。）
+**Linux / macOS**
+```sh
+git clone --depth 1 https://github.com/jsar-project/AIUI /tmp/AIUI
+mkdir -p "$HOME/.dsh/.agent-presets/aiui-dev/skills/aiui-dev"
+cp -r /tmp/AIUI/skills/aiui-dev/. "$HOME/.dsh/.agent-presets/aiui-dev/skills/aiui-dev/"
+rm -rf /tmp/AIUI
+```
+
+验证：`~/.dsh/.agent-presets/aiui-dev/skills/aiui-dev/SKILL.md` 存在即成功。
 
 ## 3. 配置（可选）
 
