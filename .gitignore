@@ -1,3 +1,7 @@
 node_modules/
 *.log
 .DS_Store
+
+# Local bundle install artifacts (the profile's pnpm owns the real install)
+pnpm-lock.yaml
+pnpm-workspace.yaml
