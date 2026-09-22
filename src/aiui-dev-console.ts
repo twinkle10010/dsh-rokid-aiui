@@ -13,18 +13,30 @@
  * session's preset label; only when it equals the configured `presetLabel`
  * (default "AIUI 开发模式") is any UI shown.
  *
+ * Every `/api/aiui-*` route passes the composition's `connection` trust fence
+ * first (`requestRejection`): the Host/Origin check defeats DNS rebinding and
+ * the login-token cookie gates each caller, so a random page in the operator's
+ * browser can neither read project files nor spawn the preview server.
+ *
+ * The browser half lives in `client/injected.js` (ordinary JavaScript, read
+ * once at activation and injected into the index tap), not in a host-side
+ * template literal.
+ *
  * Configuration (the bundle row's `config`): `workspaceRoot` (directory to
  * scan for AIUI projects), `projectFile` (where the chosen project marker is
  * stored), `aixCli` (override the resolved @yodaos-pkg/aix-cli path), `aixCwd`
- * (spawn cwd for the dev server). All optional; defaults derive from the
- * invoking directory.
- *
- * Pure DOM script (no framework, no client bundle, no runtime build).
+ * (spawn cwd for the dev server), `scanDepth`, `previewStartTimeoutMs`, and
+ * `legacyPresetSync`. All optional; defaults derive from the invoking
+ * directory.
  */
 
-import { readFile, writeFile, readdir, stat } from 'node:fs/promises'
+import { readFile, writeFile, readdir, stat, mkdir } from 'node:fs/promises'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 import { join, resolve, basename, dirname, relative, sep } from 'node:path'
 import { createRequire } from 'node:module'
+import { fileURLToPath } from 'node:url'
+import { homedir } from 'node:os'
+import z from '@deepseek-ai/schemastery'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 
@@ -32,13 +44,111 @@ const require = createRequire(import.meta.url)
 
 export const name = 'aiui-dev-console'
 
-export const inject = ['webServer', 'subprocess']
+export const inject = ['webServer', 'subprocess', 'connection']
+
+/* ── bundled agent preset (legacy, opt-in) ──────────────────────────────── */
+
+/**
+ * The Harness home: `$DSH_HOME` when set (non-blank), else `~/.dsh`.
+ *
+ * Mirrors `@deepseek-ai/dsh-home-paths#resolveDshHome()` (same precedence, same
+ * blank-value rule) without importing a harness-internal package, so the plugin
+ * resolves the home identically to the running dsh process.
+ */
+export function resolveDshHome(): string {
+  const fromEnv = process.env.DSH_HOME
+  return resolve(fromEnv !== undefined && fromEnv.trim().length > 0 ? fromEnv : join(homedir(), '.dsh'))
+}
+
+/** The root where the `agent-presets` service discovers user-authored presets. */
+export function userPresetDir(): string {
+  return join(resolveDshHome(), '.agent-presets')
+}
+
+/** The bundled preset directory shipped inside this package (`<pkg>/preset`). */
+export function bundledPresetDir(): string {
+  return fileURLToPath(new URL('../preset/', import.meta.url))
+}
+
+/** Marker file naming the bundle version that last installed the preset. */
+const PRESET_MARKER = '.dsh-bundle-version'
+
+/** Recursively copy files that are missing or differ; never deletes extra files. */
+async function copyTree(src: string, dest: string): Promise<number> {
+  await mkdir(dest, { recursive: true })
+  let copied = 0
+  const entries = await readdir(src, { withFileTypes: true })
+  for (const entry of entries) {
+    const source = join(src, entry.name)
+    const target = join(dest, entry.name)
+    if (entry.isDirectory()) {
+      copied += await copyTree(source, target)
+    } else if (entry.isFile()) {
+      const [sourceBuf, targetBuf] = await Promise.all([
+        readFile(source),
+        readFile(target).catch(() => null),
+      ])
+      if (targetBuf === null || !sourceBuf.equals(targetBuf)) {
+        await writeFile(target, sourceBuf)
+        copied += 1
+      }
+    }
+  }
+  return copied
+}
+
+/** Result of {@link syncBundledPreset}. */
+export interface PresetSyncResult {
+  /** The user-root directory the preset lives in. */
+  dir: string
+  /** Whether files were (re)written this call. */
+  installed: boolean
+  /** Number of files written. */
+  copied: number
+  /** Set when the sync failed; the plugin logs it and carries on. */
+  error?: string
+}
+
+/**
+ * Install the bundled `aiui-dev` preset into the **legacy** user preset root
+ * (`$DSH_HOME/.agent-presets/aiui-dev`, the `preset.yml` + `agent.cordis.yml`
+ * directory format).
+ *
+ * The current Harness no longer reads that directory: agent presets are
+ * declaration rows carried by a bundle patch, which is what the sibling
+ * `dsh-aiui-preset` bundle provides. This sync therefore stays available only
+ * behind `legacyPresetSync: true`, for an older Harness that still scans the
+ * user root. It never rejects: an unreadable/unwritable home degrades to a log
+ * line, not a failed boot.
+ */
+export async function syncBundledPreset(version: string): Promise<PresetSyncResult> {
+  const dir = join(userPresetDir(), 'aiui-dev')
+  try {
+    const markerPath = join(dir, PRESET_MARKER)
+    let marker: string | null = null
+    try {
+      marker = (await readFile(markerPath, 'utf-8')).trim()
+    } catch {
+      /* absent marker: first install or pre-0.2.0 manual copy */
+    }
+    if (marker === version) return { dir, installed: false, copied: 0 }
+    const copied = await copyTree(bundledPresetDir(), dir)
+    await writeFile(markerPath, version + '\n', 'utf-8')
+    return { dir, installed: true, copied }
+  } catch (error) {
+    return { dir, installed: false, copied: 0, error: error instanceof Error ? error.message : String(error) }
+  }
+}
 
 /* ── host-side project/file serving ─────────────────────────────────────── */
 
 const MAX_FILE_BYTES = 1048576 // 1 MiB
 const MAX_TREE_ITEMS = 3000
 const MAX_TREE_DEPTH = 6
+/** Directories visited by one project scan (bounds a cold recursive sweep). */
+const MAX_SCAN_DIRS = 400
+/** After a failed start, do not respawn the preview server before this delay. */
+const RETRY_COOLDOWN_MS = 30000
 const IGNORED_DIRS = new Set([
   'node_modules', '.git', 'dist', 'lib', '.dsh', '.agent-presets', 'sessions',
   'storages', 'profiles', 'aiui-preview', 'aix-tool', 'scratch-plugin', '.cache',
@@ -55,25 +165,71 @@ const IMAGE_EXT: Record<string, string> = {
   '.bmp': 'image/bmp',
 }
 
-function json(res: { setHeader: (k: string, v: string) => void; end: (s: string) => void }, value: unknown): void {
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+function json(res: ServerResponse, value: unknown): void {
   res.setHeader('Content-Type', 'application/json; charset=utf-8')
   res.setHeader('Cache-Control', 'no-store')
   res.end(JSON.stringify(value))
 }
 
+type RouteHandler = (req: IncomingMessage, res: ServerResponse) => Promise<void> | void
+
 /** Wrap a route handler so a crash answers JSON with the real error instead of a bare 400. */
-function safeHandler(
-  handler: (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => Promise<void> | void,
-): (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => Promise<void> {
+function safeHandler(handler: RouteHandler): RouteHandler {
   return async (req, res) => {
     try {
       await handler(req, res)
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      const stack = error instanceof Error ? error.stack : undefined
-      json(res, { ok: false, error: message, stack })
+      if (res.headersSent) { res.end(); return }
+      json(res, { ok: false, error: messageOf(error), stack: error instanceof Error ? error.stack : undefined })
     }
   }
+}
+
+/** The browser trust fence owned by the composition's `connection` service. */
+interface ConnectionLike {
+  requestRejection(request: { readonly headers: IncomingMessage['headers'] }): 401 | 403 | undefined
+}
+
+/** The `connection` service, typed locally so this package needs no client dependency. */
+function connectionOf(ctx: Context): ConnectionLike | undefined {
+  try {
+    return Reflect.get(ctx, 'connection') as ConnectionLike | undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * One API route: method check, then the connection trust fence, then the body.
+ * Order matters — an unauthenticated caller must not reach a handler that
+ * reads the project tree, writes the marker, or spawns a process.
+ */
+function apiRoute(
+  method: 'GET' | 'POST',
+  connection: ConnectionLike | undefined,
+  handler: RouteHandler,
+): RouteHandler {
+  return safeHandler(async (req, res) => {
+    if ((req.method ?? 'GET').toUpperCase() !== method) {
+      res.statusCode = 405
+      res.setHeader('Allow', method)
+      json(res, { ok: false, error: `method not allowed; use ${method}` })
+      return
+    }
+    if (connection !== undefined) {
+      const rejection = connection.requestRejection({ headers: req.headers })
+      if (rejection !== undefined) {
+        res.statusCode = rejection
+        json(res, { ok: false, error: rejection === 401 ? 'unauthorized' : 'forbidden' })
+        return
+      }
+    }
+    await handler(req, res)
+  })
 }
 
 /** Resolve the @yodaos-pkg/aix-cli entry (dist/cli.js) from this package's own dependencies. */
@@ -124,6 +280,55 @@ async function buildTree(projectRoot: string, dir: string, depth: number, budget
   return out
 }
 
+/** One AIUI project found under the workspace root. */
+export interface DiscoveredProject {
+  /** Folder name. */
+  name: string
+  /** Absolute project root (the directory holding `app.json`). */
+  path: string
+  /** Path relative to the workspace root, `/`-separated; equals `name` at the top level. */
+  rel: string
+}
+
+/**
+ * Find AIUI projects (directories holding `app.json`) under `root`, up to
+ * `maxDepth` levels deep.
+ *
+ * One level was not enough: a common layout keeps projects inside a grouping
+ * folder (`<root>/<group>/<project>/app.json`). A directory that is itself a
+ * project ends that branch — a project never contains another one — and the
+ * sweep is bounded by MAX_SCAN_DIRS so a huge workspace cannot stall boot.
+ *
+ * Exported for diagnostics: the sweep answers `/api/aiui-projects`, and its
+ * depth/branch rules are worth checking directly.
+ */
+export async function discoverProjects(root: string, maxDepth: number): Promise<DiscoveredProject[]> {
+  const found: DiscoveredProject[] = []
+  const budget = { dirs: MAX_SCAN_DIRS }
+  async function walk(dir: string, depth: number): Promise<void> {
+    if (depth > maxDepth || budget.dirs <= 0) return
+    const marker = await stat(join(dir, 'app.json')).catch(() => null)
+    if (marker !== null && marker.isFile()) {
+      const rel = relative(root, dir).split(sep).join('/')
+      found.push({ name: basename(dir), path: dir, rel: rel === '' ? basename(dir) : rel })
+      return
+    }
+    if (depth === maxDepth) return
+    const entries = await readdir(dir, { withFileTypes: true }).catch(() => [])
+    for (const entry of entries) {
+      if (budget.dirs <= 0) break
+      if (!entry.isDirectory() || entry.isSymbolicLink()) continue
+      if (entry.name.startsWith('.') || IGNORED_DIRS.has(entry.name)) continue
+      budget.dirs -= 1
+      await walk(join(dir, entry.name), depth + 1)
+    }
+  }
+  await walk(root, 0)
+  return found.sort((a, b) => a.rel.localeCompare(b.rel))
+}
+
+/* ── configuration ──────────────────────────────────────────────────────── */
+
 /** Bundle-row configuration. */
 export interface AiuiDevConsoleConfig {
   /** Directory to scan for AIUI projects (dirs containing app.json). */
@@ -138,44 +343,147 @@ export interface AiuiDevConsoleConfig {
   presetLabel?: string
   /** Agent-preset id that activates the console UI (matched as a fallback). */
   presetId?: string
+  /** How many directory levels below `workspaceRoot` are scanned for projects. */
+  scanDepth?: number
+  /** Deadline for `aix preview --dev` to print its URL before the start fails. */
+  previewStartTimeoutMs?: number
+  /** Also sync the bundled preset into the legacy `$DSH_HOME/.agent-presets` root. */
+  legacyPresetSync?: boolean
+}
+
+/**
+ * Every field is optional by design: the row activates with no config at all
+ * and resolves each default at runtime, and a partial override (only
+ * `workspaceRoot`, say) must never fail validation.
+ */
+export const Config: z<AiuiDevConsoleConfig> = z.object({
+  workspaceRoot: z.string().description('Directory scanned for AIUI projects (directories containing app.json); defaults to $AIUI_WORKSPACE, then the invoking directory.'),
+  projectFile: z.string().description('Marker file recording the chosen project; defaults to <workspaceRoot>/.aiui/current-project.json.'),
+  aixCli: z.string().description('Override the resolved @yodaos-pkg/aix-cli entry (dist/cli.js).'),
+  aixCwd: z.string().description('Working directory for the `aix preview` child process; defaults to workspaceRoot.'),
+  presetLabel: z.string().description('Agent-preset display label that activates the console UI.'),
+  presetId: z.string().description('Agent-preset id that also activates the console UI.'),
+  scanDepth: z.number().min(0).max(8).description('Directory levels below workspaceRoot scanned for projects (default 3).'),
+  previewStartTimeoutMs: z.number().min(1000).max(120000).description('How long to wait for `aix preview --dev` to print its URL (default 15000 ms).'),
+  legacyPresetSync: z.boolean().description('Also sync the bundled preset into the legacy $DSH_HOME/.agent-presets root (default false; the current Harness reads preset declaration rows instead).'),
+})
+
+/* ── the browser half ───────────────────────────────────────────────────── */
+
+/** The injectable browser script shipped beside the built host half. */
+const CLIENT_SCRIPT_URL = new URL('../client/injected.js', import.meta.url)
+
+/**
+ * Read the browser script and substitute the two placeholder tokens with the
+ * JSON encoding of the label and id.
+ *
+ * The script is ordinary JavaScript in its own file, so it is editable and
+ * syntax-checkable without the backtick-escaping hazard of a host template
+ * literal. Throws when the asset is missing; the caller degrades to
+ * routes-only rather than failing activation.
+ */
+async function loadClientScript(presetLabel: string, presetId: string): Promise<string> {
+  const template = await readFile(fileURLToPath(CLIENT_SCRIPT_URL), 'utf-8')
+  const script = template
+    .replace('"__AIUI_PRESET_LABEL__"', JSON.stringify(presetLabel))
+    .replace('"__AIUI_PRESET_ID__"', JSON.stringify(presetId))
+  // The script is injected inside a <script> element: an embedded end tag would
+  // close it early.
+  return script.replace(/<\/script/gi, '<\\/script')
+}
+
+/* ── composition ────────────────────────────────────────────────────────── */
+
+interface PreviewStatus {
+  running: boolean
+  url: string | null
+  error: string | null
+  project: string | null
 }
 
 /** Compose the plugin: host routes + index tap injecting the console script. */
-export function apply(ctx: Context, config: AiuiDevConsoleConfig = {}): void {
+export async function apply(ctx: Context, config: AiuiDevConsoleConfig = {}): Promise<void> {
   const workspaceRoot = config.workspaceRoot ?? process.env.AIUI_WORKSPACE ?? process.cwd()
   const projectFile = config.projectFile ?? join(workspaceRoot, '.aiui', 'current-project.json')
   const aixCwd = config.aixCwd ?? workspaceRoot
   const aixCli = config.aixCli ?? resolveAixCli()
   const presetLabel = config.presetLabel ?? 'AIUI 开发模式'
   const presetId = config.presetId ?? 'aiui-dev'
+  const scanDepth = config.scanDepth ?? 3
+  const previewStartTimeoutMs = config.previewStartTimeoutMs ?? 15000
+  const connection = connectionOf(ctx)
+
+  if (connection === undefined) {
+    ctx.logger.warn('dsh-rokid-aiui: the `connection` service is missing — /api/aiui-* routes stay unfenced')
+  }
+
+  // The current Harness reads preset declaration rows, not the legacy
+  // $DSH_HOME/.agent-presets directory; the sibling `dsh-aiui-preset` bundle
+  // carries the "AIUI 开发模式" row. The legacy sync is opt-in.
+  if (config.legacyPresetSync === true) {
+    const presetSync = await syncBundledPreset(require('../package.json').version)
+    if (presetSync.error !== undefined) {
+      ctx.logger.warn(`dsh-rokid-aiui: could not sync the bundled legacy preset (${presetSync.error})`)
+    } else if (presetSync.installed) {
+      ctx.logger.info(`dsh-rokid-aiui: synced legacy agent preset "aiui-dev" (${presetSync.copied} files) → ${presetSync.dir}`)
+    }
+  } else {
+    ctx.logger.info('dsh-rokid-aiui: legacy preset sync is off; the "AIUI 开发模式" preset comes from the dsh-aiui-preset bundle')
+  }
 
   // ── live preview dev server (official `aix preview --dev`) ──────────────
   // Runs `aix preview --dev <project>` for the current project. That server
   // watches the project directory and hot-reloads the browser over WebSocket,
   // so no static snapshot export is needed. Its port is chosen by aix at
-  // random, so we parse the URL from stdout and hand it to the browser.
+  // random, so we parse the URL from its output and hand it to the browser.
   let devHandle: ReturnType<typeof ctx.subprocess.spawn> | null = null
   let devUrl: string | null = null
   let devProject: string | null = null
-  let ensurePromise: Promise<{ running: boolean; url?: string; error?: string }> | null = null
+  // The failure record is keyed by project and outlives `stopDevServer()`
+  // clearing devProject; without that key the cooldown below could never match
+  // and a broken project would respawn the CLI on every heartbeat.
+  let devError: string | null = null
+  let devErrorAt = 0
+  let devErrorProject: string | null = null
+  let ensurePromise: Promise<PreviewStatus> | null = null
+
+  function recordDevError(projectPath: string, message: string): void {
+    devError = message
+    devErrorAt = Date.now()
+    devErrorProject = projectPath
+  }
+
+  function clearDevError(): void {
+    devError = null
+    devErrorAt = 0
+    devErrorProject = null
+  }
 
   function previewUrlFrom(text: string): string | null {
-    const match = /https?:\/\/127\.0\.0\.1:\d+\//.exec(text)
+    const match = /https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+\/?/.exec(text)
     return match ? match[0] : null
+  }
+
+  function collectedText(handle: ReturnType<typeof ctx.subprocess.spawn>, stream: 'stdout' | 'stderr'): string {
+    const reader = handle.collected[stream]
+    return reader ? reader.readFrom(0).text : ''
   }
 
   async function waitForPreviewUrl(handle: ReturnType<typeof ctx.subprocess.spawn>, timeoutMs: number): Promise<string | null> {
     const deadline = Date.now() + timeoutMs
     while (Date.now() < deadline) {
-      const text = handle.collected.stdout ? handle.collected.stdout.readFrom(0).text : ''
-      const url = previewUrlFrom(text)
-      if (url) return url
+      // aix prints the URL on stdout today; accept stderr too so a logging
+      // change upstream cannot silently break the start.
+      const url = previewUrlFrom(collectedText(handle, 'stdout')) ?? previewUrlFrom(collectedText(handle, 'stderr'))
+      if (url !== null) return url
+      if (devHandle !== handle) return null // stopped or superseded while waiting
       await new Promise(resolve => setTimeout(resolve, 200))
     }
     return null
   }
 
-  async function stopDevServer(): Promise<void> {
+  /** Clear the preview state; `terminate()` is safe on an already-dead child. */
+  function stopDevServer(): void {
     const handle = devHandle
     devHandle = null
     devUrl = null
@@ -183,47 +491,101 @@ export function apply(ctx: Context, config: AiuiDevConsoleConfig = {}): void {
     if (handle) { try { handle.terminate() } catch { /* already gone */ } }
   }
 
-  async function ensureDevServer(projectPath: string): Promise<{ running: boolean; url?: string; error?: string }> {
-    if (devUrl !== null && devProject === projectPath) return { running: true, url: devUrl }
-    await stopDevServer()
-    if (!aixCli) return { running: false, error: 'aix CLI not found: @yodaos-pkg/aix-cli is a dependency of this bundle' }
-    const nodePath = await ctx.subprocess.resolveExecutable('node')
-    const handle = ctx.subprocess.spawn({
-      argv: [nodePath, aixCli, 'preview', projectPath, '--dev'],
-      cwd: aixCwd,
-      stdio: { stdin: 'ignore', stdout: { maxBytes: 8192 }, stderr: { maxBytes: 8192 } },
-      graceMs: 5000,
+  /**
+   * Watch one preview child: a server that dies mid-session must invalidate the
+   * cached URL, otherwise the console keeps pointing at a dead port. Identity
+   * is checked so a superseded handle cannot clear the newer server's state.
+   */
+  function watchPreviewExit(handle: ReturnType<typeof ctx.subprocess.spawn>, projectPath: string): void {
+    void handle.done.then((outcome) => {
+      if (devHandle !== handle) return
+      devHandle = null
+      devUrl = null
+      devProject = null
+      const reason = outcome.exitCode === null ? `signal ${outcome.signal ?? 'unknown'}` : `exit code ${outcome.exitCode}`
+      recordDevError(projectPath, `aix preview 进程已退出（${reason}）`)
+    }).catch((error: unknown) => {
+      if (devHandle !== handle) return
+      devHandle = null
+      devUrl = null
+      devProject = null
+      recordDevError(projectPath, `aix preview 进程异常：${messageOf(error)}`)
     })
+  }
+
+  async function ensureDevServer(projectPath: string, force: boolean): Promise<PreviewStatus> {
+    if (devUrl !== null && devProject === projectPath) {
+      return { running: true, url: devUrl, error: null, project: projectPath }
+    }
+    // A different project's failure says nothing about this one.
+    if (devErrorProject !== null && devErrorProject !== projectPath) clearDevError()
+    // A failed start keeps its diagnostic for a moment instead of respawning
+    // the CLI on every heartbeat; an explicit retry bypasses the cooldown.
+    if (!force && devError !== null && devErrorProject === projectPath && Date.now() < devErrorAt + RETRY_COOLDOWN_MS) {
+      return { running: false, url: null, error: devError, project: projectPath }
+    }
+    await stopDevServer()
+    if (aixCli === null) {
+      recordDevError(projectPath, 'aix CLI 未找到：@yodaos-pkg/aix-cli 是本 bundle 的依赖')
+      return { running: false, url: null, error: devError, project: projectPath }
+    }
+    let nodePath: string
+    try {
+      nodePath = await ctx.subprocess.resolveExecutable('node')
+    } catch (error) {
+      recordDevError(projectPath, `无法解析 node 可执行文件：${messageOf(error)}`)
+      return { running: false, url: null, error: devError, project: projectPath }
+    }
+    let handle: ReturnType<typeof ctx.subprocess.spawn>
+    try {
+      handle = ctx.subprocess.spawn({
+        argv: [nodePath, aixCli, 'preview', projectPath, '--dev'],
+        cwd: aixCwd,
+        stdio: { stdin: 'ignore', stdout: { maxBytes: 8192 }, stderr: { maxBytes: 8192 } },
+        graceMs: 5000,
+      })
+    } catch (error) {
+      recordDevError(projectPath, `无法启动 aix preview：${messageOf(error)}`)
+      return { running: false, url: null, error: devError, project: projectPath }
+    }
+    clearDevError()
     devHandle = handle
     devProject = projectPath
-    const url = await waitForPreviewUrl(handle, 10000)
-    if (url !== null) {
+    watchPreviewExit(handle, projectPath)
+    const url = await waitForPreviewUrl(handle, previewStartTimeoutMs)
+    if (url !== null && devHandle === handle) {
       devUrl = url
-      return { running: true, url }
+      clearDevError()
+      return { running: true, url, error: null, project: projectPath }
     }
-    const errText = handle.collected.stderr ? handle.collected.stderr.readFrom(0).text : ''
+    if (devHandle !== handle) return { running: false, url: null, error: devError, project: projectPath }
+    const errText = collectedText(handle, 'stderr').trim() || collectedText(handle, 'stdout').trim()
     await stopDevServer()
-    return { running: false, error: errText || 'aix preview --dev did not report a URL in time' }
+    recordDevError(projectPath, errText
+      ? errText.split(/\r?\n/).slice(-6).join('\n')
+      : `aix preview --dev 未在 ${previewStartTimeoutMs}ms 内输出预览地址`)
+    return { running: false, url: null, error: devError, project: projectPath }
   }
 
   // Stop the dev server when the plugin is disposed.
-  ctx.effect(() => () => { void stopDevServer() }, 'aiui-dev-console: stop preview dev server')
+  ctx.effect(() => () => { stopDevServer() }, 'aiui-dev-console: stop preview dev server')
 
-  // GET /api/aiui-preview — ensure the live preview server is running for the
-  // current project and return its URL (running:false when no project is set).
+  // GET /api/aiui-preview[?retry=1] — ensure the live preview server is running
+  // for the current project and return its URL, or the reason it failed.
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
     path: '/api/aiui-preview',
-    handler: safeHandler(async (_req, res) => {
+    handler: apiRoute('GET', connection, async (req, res) => {
+      const force = new URL(req.url ?? '/', 'http://localhost').searchParams.get('retry') === '1'
       const project = await readProjectInfo(projectFile)
       if (!project) {
-        await stopDevServer()
-        json(res, { ok: true, running: false, url: null })
+        stopDevServer()
+        json(res, { ok: true, running: false, url: null, error: null, project: null })
         return
       }
-      if (!ensurePromise) ensurePromise = ensureDevServer(project.path).finally(() => { ensurePromise = null })
-      const result = await ensurePromise
-      json(res, { ok: true, running: result.running, url: result.url ?? null, error: result.error })
+      if (!ensurePromise) ensurePromise = ensureDevServer(project.path, force).finally(() => { ensurePromise = null })
+      const status = await ensurePromise
+      json(res, { ok: true, running: status.running, url: status.url, error: status.error, project: status.project })
     }),
   }), 'aiui-dev-console: /api/aiui-preview')
 
@@ -231,7 +593,7 @@ export function apply(ctx: Context, config: AiuiDevConsoleConfig = {}): void {
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
     path: '/api/aiui-project',
-    handler: safeHandler(async (_req, res) => {
+    handler: apiRoute('GET', connection, async (_req, res) => {
       json(res, { ok: true, project: await readProjectInfo(projectFile) })
     }),
   }), 'aiui-dev-console: /api/aiui-project')
@@ -240,15 +602,9 @@ export function apply(ctx: Context, config: AiuiDevConsoleConfig = {}): void {
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
     path: '/api/aiui-projects',
-    handler: safeHandler(async (_req, res) => {
-      const entries = await readdir(workspaceRoot, { withFileTypes: true }).catch(() => [])
-      const projects: { name: string; path: string }[] = []
-      for (const entry of entries) {
-        if (!entry.isDirectory() || IGNORED_DIRS.has(entry.name)) continue
-        const marker = await stat(join(workspaceRoot, entry.name, 'app.json')).catch(() => null)
-        if (marker && marker.isFile()) projects.push({ name: entry.name, path: join(workspaceRoot, entry.name) })
-      }
-      json(res, { ok: true, projects })
+    handler: apiRoute('GET', connection, async (_req, res) => {
+      const projects = await discoverProjects(workspaceRoot, scanDepth)
+      json(res, { ok: true, workspaceRoot, projects })
     }),
   }), 'aiui-dev-console: /api/aiui-projects')
 
@@ -256,7 +612,7 @@ export function apply(ctx: Context, config: AiuiDevConsoleConfig = {}): void {
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
     path: '/api/aiui-project-select',
-    handler: safeHandler(async (req, res) => {
+    handler: apiRoute('POST', connection, async (req, res) => {
       let body = ''
       req.on('data', (chunk) => { body += String(chunk) })
       req.on('end', async () => {
@@ -297,10 +653,15 @@ export function apply(ctx: Context, config: AiuiDevConsoleConfig = {}): void {
             json(res, { ok: false, error: '不是 AIUI 项目（缺少 app.json）', received: raw, checked: join(root, 'app.json') })
             return
           }
+          // The marker lives at <workspaceRoot>/.aiui/current-project.json; that
+          // directory usually does not exist yet, so create it first.
+          await mkdir(dirname(projectFile), { recursive: true })
           await writeFile(projectFile, JSON.stringify({ name: basename(projectRoot), path: projectRoot, at: new Date().toISOString() }), 'utf-8')
+          // Switching projects invalidates a server started for the old one.
+          if (devProject !== null && devProject !== projectRoot) stopDevServer()
           json(res, { ok: true, name: basename(projectRoot), path: projectRoot, note })
         } catch (error) {
-          json(res, { ok: false, error: String((error as Error).message || error) })
+          json(res, { ok: false, error: messageOf(error) })
         }
       })
     }),
@@ -310,7 +671,7 @@ export function apply(ctx: Context, config: AiuiDevConsoleConfig = {}): void {
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
     path: '/api/aiui-project-tree',
-    handler: safeHandler(async (_req, res) => {
+    handler: apiRoute('GET', connection, async (_req, res) => {
       const project = await readProjectInfo(projectFile)
       if (!project) { json(res, { ok: false, error: 'no project selected' }); return }
       const tree = await buildTree(project.path, project.path, 0, { n: MAX_TREE_ITEMS })
@@ -322,7 +683,7 @@ export function apply(ctx: Context, config: AiuiDevConsoleConfig = {}): void {
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
     path: '/api/aiui-project-file',
-    handler: safeHandler(async (req, res) => {
+    handler: apiRoute('GET', connection, async (req, res) => {
       const project = await readProjectInfo(projectFile)
       if (!project) { json(res, { ok: false, error: 'no project selected' }); return }
       const url = new URL(req.url ?? '/', 'http://localhost')
@@ -341,7 +702,8 @@ export function apply(ctx: Context, config: AiuiDevConsoleConfig = {}): void {
       }
       const buf = await readFile(target).catch(() => null)
       if (buf === null) { json(res, { ok: false, error: 'unreadable' }); return }
-      const ext = target.slice(target.lastIndexOf('.')).toLowerCase()
+      const dot = target.lastIndexOf('.')
+      const ext = dot > target.lastIndexOf(sep) ? target.slice(dot).toLowerCase() : ''
       const mime = IMAGE_EXT[ext]
       if (mime !== undefined) {
         // Images open as an inline preview instead of being rejected.
@@ -361,648 +723,13 @@ export function apply(ctx: Context, config: AiuiDevConsoleConfig = {}): void {
   }), 'aiui-dev-console: /api/aiui-project-file')
 
   // Index tap: inject the browser script.
-  ctx.effect(
-    () => ctx.webServer.tapIndex(html => html.replace(
-      '</body>',
-      `<script>${buildInjectedScript(presetLabel, presetId)}</script></body>`,
-    )),
-    'aiui-dev-console: index tap',
-  )
-}
-
-/* ── browser-side injected script ───────────────────────────────────────── */
-
-function buildInjectedScript(presetLabel: string, presetId: string): string {
-  return `
-(function () {
-  var KEY = 'dsh-aiui-dev-console'
-  if (document.getElementById(KEY)) return
-
-  var PREVIEW_URL = null // set from /api/aiui-preview (the aix preview --dev URL)
-  var PRESET_TEXT = ${JSON.stringify(presetLabel)}
-  var PRESET_ID = ${JSON.stringify(presetId)}
-  var HEADER_SLOT = 'conversation.session.header.actions'
-
-  var CSS = '' +
-    '#dsh-aiui-dev-console{position:fixed;inset:0;pointer-events:none;z-index:9500;}' +
-    /* preview console */
-    '#dsh-aiui-launcher{pointer-events:auto;position:fixed;left:16px;bottom:16px;display:flex;align-items:center;gap:8px;' +
-    'padding:8px 14px;border-radius:999px;border:1px solid rgba(64,255,94,.55);background:rgba(0,0,0,.82);color:#40ff5e;' +
-    'font-size:13px;font-weight:600;cursor:grab;user-select:none;touch-action:none;box-shadow:0 6px 24px rgba(0,0,0,.45);' +
-    'font-family:inherit;line-height:1.4;}' +
-    '#dsh-aiui-console-btn{pointer-events:auto;position:fixed;left:16px;bottom:16px;width:46px;height:46px;border-radius:12px;' +
-    'border:1px solid rgba(64,255,94,.5);background:rgba(0,0,0,.85);color:#40ff5e;cursor:grab;user-select:none;touch-action:none;' +
-    'display:flex;align-items:center;justify-content:center;box-shadow:0 6px 24px rgba(0,0,0,.45);font-family:inherit;}' +
-    '#dsh-aiui-console-btn:hover{border-color:#40ff5e;box-shadow:0 8px 28px rgba(64,255,94,.3)}' +
-    '#dsh-aiui-terminal{font-family:Consolas,Menlo,monospace;font-size:15px;font-weight:700;letter-spacing:-1px;pointer-events:none;}' +
-    '#dsh-aiui-dot{width:8px;height:8px;border-radius:50%;background:#40ff5e;box-shadow:0 0 8px #40ff5e;animation:dshAiuiPulse 2s infinite;}' +
-    '@keyframes dshAiuiPulse{0%,100%{opacity:1}50%{opacity:.35}}' +
-    '#dsh-aiui-panel{pointer-events:auto;position:fixed;width:1200px;max-height:88vh;display:flex;flex-direction:column;' +
-    'border-radius:14px;border:1px solid rgba(64,255,94,.4);background:rgba(10,12,10,.96);' +
-    'box-shadow:0 18px 60px rgba(0,0,0,.6), 0 0 0 1px rgba(64,255,94,.12);overflow:hidden;color:#e8ffe9;font-family:inherit;}' +
-    '#dsh-aiui-panel-head{display:flex;align-items:center;justify-content:space-between;padding:9px 12px 9px 14px;' +
-    'cursor:grab;user-select:none;touch-action:none;border-bottom:1px solid rgba(64,255,94,.22);' +
-    'background:linear-gradient(180deg, rgba(64,255,94,.10), rgba(64,255,94,.04));}' +
-    '#dsh-aiui-panel-title{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:#40ff5e;pointer-events:none;}' +
-    '#dsh-aiui-panel-dot{width:7px;height:7px;border-radius:50%;background:#40ff5e;box-shadow:0 0 6px #40ff5e;}' +
-    '#dsh-aiui-panel-actions{display:flex;align-items:center;gap:10px;pointer-events:auto;}' +
-    '#dsh-aiui-open{color:rgba(64,255,94,.8);font-size:12px;text-decoration:none;cursor:pointer;}' +
-    '#dsh-aiui-close{background:color-mix(in srgb, var(--dsw-alias-label-primary) 6%, transparent);border:1px solid var(--dsw-alias-border-l2);' +
-    'color:var(--dsw-alias-label-secondary);font-size:13px;cursor:pointer;line-height:1;padding:4px 9px;border-radius:8px;font-family:inherit;}' +
-    '#dsh-aiui-close:hover{color:#fff;background:rgba(220,38,38,.8);border-color:rgba(220,38,38,.8)}' +
-    '#dsh-aiui-frame{width:100%;height:620px;border:none;display:block;background:#fff;}' +
-    '#dsh-aiui-foot{font-size:11px;opacity:.6;padding:6px 14px;border-top:1px solid rgba(64,255,94,.15);color:rgba(232,255,233,.7);}' +
-    /* project panel (right) — theme-aligned colors */
-    '#dsh-aiui-proj{pointer-events:auto;position:fixed;right:0;top:0;bottom:0;width:280px;display:flex;flex-direction:column;' +
-    'background:var(--dsw-alias-bg-layer-1);border-left:1px solid var(--dsw-alias-border-l1);color:var(--dsw-alias-label-primary);font-family:inherit;z-index:1;}' +
-    '#dsh-aiui-proj-head{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--dsw-alias-border-l1);' +
-    'font-size:12px;font-weight:600;color:var(--dsw-alias-label-primary);}' +
-    '#dsh-aiui-proj-title{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}' +
-    '#dsh-aiui-proj-btn{background:none;border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-primary);border-radius:6px;cursor:pointer;' +
-    'font-size:11px;padding:2px 7px;font-family:inherit;}' +
-    '#dsh-aiui-proj-btn:hover{background:color-mix(in srgb, var(--dsw-alias-label-primary) 10%, transparent)}' +
-    '#dsh-aiui-proj-toggle{background:none;border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);border-radius:6px;cursor:pointer;' +
-    'font-size:12px;padding:2px 8px;font-family:inherit;line-height:1.3;}' +
-    '#dsh-aiui-proj-toggle:hover{color:var(--dsw-alias-label-primary);background:color-mix(in srgb, var(--dsw-alias-label-primary) 10%, transparent)}' +
-    '#dsh-aiui-proj-restore{pointer-events:auto;position:fixed;right:0;top:0;bottom:0;width:26px;display:flex;align-items:center;justify-content:center;' +
-    'background:var(--dsw-alias-bg-layer-1);border-left:1px solid var(--dsw-alias-border-l1);color:var(--dsw-alias-label-secondary);cursor:pointer;' +
-    'font-size:11px;writing-mode:vertical-rl;text-align:center;user-select:none;font-family:inherit;z-index:1;gap:6px;}' +
-    '#dsh-aiui-proj-restore:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2);}' +
-    '#dsh-aiui-proj-body{flex:1;overflow:auto;padding:8px 6px 20px;}' +
-    '#dsh-aiui-proj-note{font-size:12px;color:var(--dsw-alias-label-secondary);padding:10px 12px;line-height:1.6;}' +
-    '#dsh-aiui-proj-pick{display:block;width:100%;text-align:left;background:none;border:none;color:var(--dsw-alias-label-primary);font-size:12px;' +
-    'padding:6px 10px;cursor:pointer;border-radius:6px;font-family:inherit;}' +
-    '#dsh-aiui-proj-pick:hover{background:color-mix(in srgb, var(--dsw-alias-label-primary) 10%, transparent);color:var(--dsw-alias-brand-primary);}' +
-    '#dsh-aiui-tree{margin:0;padding:0;list-style:none;font-size:12px;}' +
-    '#dsh-aiui-tree ul{margin:0;padding:0 0 0 14px;list-style:none;}' +
-    '#dsh-aiui-tree li{line-height:1.8;}' +
-    '#dsh-aiui-tree .dsh-aiui-dir{cursor:pointer;display:flex;align-items:center;gap:4px;color:var(--dsw-alias-label-primary);padding:1px 6px;border-radius:5px;}' +
-    '#dsh-aiui-tree .dsh-aiui-dir:hover{background:color-mix(in srgb, var(--dsw-alias-label-primary) 10%, transparent)}' +
-    '#dsh-aiui-tree .dsh-aiui-file{cursor:pointer;display:flex;align-items:center;gap:4px;color:var(--dsw-alias-label-secondary);' +
-    'padding:1px 6px;border-radius:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}' +
-    '#dsh-aiui-tree .dsh-aiui-file:hover{background:color-mix(in srgb, var(--dsw-alias-label-primary) 10%, transparent);color:var(--dsw-alias-label-primary)}' +
-    '#dsh-aiui-tree .dsh-aiui-arrow{width:12px;flex:none;color:var(--dsw-alias-label-secondary);font-size:10px;}' +
-    '#dsh-aiui-tree .dsh-aiui-ic{flex:none;width:14px;text-align:center;}' +
-    /* source viewer — theme-aligned colors */
-    '#dsh-aiui-src{pointer-events:auto;position:fixed;display:flex;flex-direction:column;width:720px;max-width:60vw;' +
-    'max-height:80vh;border-radius:12px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-overlay);overflow:hidden;' +
-    'color:var(--dsw-alias-label-primary);font-family:inherit;box-shadow:0 18px 60px rgba(0,0,0,.45);}' +
-    '#dsh-aiui-src-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;cursor:grab;' +
-    'user-select:none;touch-action:none;border-bottom:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2);}' +
-    '#dsh-aiui-src-path{flex:1;font-size:12px;color:var(--dsw-alias-label-primary);font-family:Consolas,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}' +
-    '#dsh-aiui-src-pre{margin:0;padding:14px;overflow:auto;font-family:Consolas,Menlo,monospace;font-size:12px;line-height:1.6;' +
-    'color:var(--dsw-alias-label-primary);white-space:pre;tab-size:2;flex:1;min-height:0;}' +
-    '#dsh-aiui-src-img{flex:1;display:none;width:100%;min-height:0;object-fit:contain;padding:10px;box-sizing:border-box;' +
-    'background:var(--dsw-alias-bg-base);}' +
-    /* project picker dialog */
-    '#dsh-aiui-dlg{pointer-events:auto;position:fixed;inset:0;display:flex;align-items:center;justify-content:center;' +
-    'background:rgba(0,0,0,.5);z-index:9600;font-family:inherit;}' +
-    '#dsh-aiui-dlg-card{width:520px;max-width:92vw;background:var(--dsw-alias-bg-overlay);border:1px solid var(--dsw-alias-border-l2);' +
-    'border-radius:16px;padding:22px;box-shadow:0 24px 70px rgba(0,0,0,.55);color:var(--dsw-alias-label-primary);}' +
-    '#dsh-aiui-dlg-title{font-size:16px;font-weight:600;margin:0 0 6px;}' +
-    '#dsh-aiui-dlg-sub{font-size:13px;line-height:1.6;color:var(--dsw-alias-label-secondary);margin:0 0 16px;}' +
-    '#dsh-aiui-dlg-list{display:flex;flex-direction:column;gap:8px;max-height:300px;overflow:auto;margin:14px 0 4px;}' +
-    '#dsh-aiui-dlg-item{display:flex;align-items:center;gap:10px;text-align:left;background:none;border:1px solid var(--dsw-alias-border-l1);' +
-    'color:var(--dsw-alias-label-primary);border-radius:10px;padding:10px 12px;cursor:pointer;font-size:13px;font-family:inherit;' +
-    'transition:border-color .12s ease, background-color .12s ease;}' +
-    '#dsh-aiui-dlg-item:hover{border-color:var(--dsw-alias-brand-primary);background:color-mix(in srgb, var(--dsw-alias-brand-primary) 8%, transparent);}' +
-    '#dsh-aiui-dlg-item .dsh-aiui-dlg-ic{flex:none;font-size:15px;}' +
-    '#dsh-aiui-dlg-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:14px;}' +
-    '#dsh-aiui-dlg-btn{background:none;border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-primary);' +
-    'border-radius:10px;padding:8px 18px;cursor:pointer;font-size:13px;font-family:inherit;transition:border-color .12s ease, color .12s ease;}' +
-    '#dsh-aiui-dlg-btn:hover{border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary);}' +
-    '#dsh-aiui-dlg-btn.primary{background:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-base);font-weight:600;}' +
-    '#dsh-aiui-dlg-browse{display:flex;align-items:center;justify-content:center;gap:8px;width:100%;padding:13px 16px;font-size:14px;font-weight:600;' +
-    'border-radius:12px;letter-spacing:.3px;box-shadow:0 4px 18px color-mix(in srgb, var(--dsw-alias-brand-primary) 30%, transparent);}' +
-    '#dsh-aiui-dlg-browse:disabled{opacity:.6;cursor:default;}' +
-    '#dsh-aiui-dlg-sep{display:flex;align-items:center;gap:10px;margin:16px 0 4px;font-size:12px;color:var(--dsw-alias-label-secondary);}' +
-    '#dsh-aiui-dlg-sep::before,#dsh-aiui-dlg-sep::after{content:"";flex:1;height:1px;background:var(--dsw-alias-border-l1);}' +
-    '#dsh-aiui-dlg-err{display:none;font-size:12.5px;color:var(--dsw-alias-state-error-primary);margin:10px 0 0;line-height:1.5;}'
-
-  function el(tag, id, styleText) {
-    var n = document.createElement(tag)
-    n.id = id
-    if (styleText) n.setAttribute('style', styleText)
-    return n
+  try {
+    const clientScript = await loadClientScript(presetLabel, presetId)
+    ctx.effect(
+      () => ctx.webServer.tapIndex(html => html.replace('</body>', `<script>${clientScript}</script></body>`)),
+      'aiui-dev-console: index tap',
+    )
+  } catch (error) {
+    ctx.logger.warn(`dsh-rokid-aiui: could not read client/injected.js (${messageOf(error)}) — the console UI stays unmounted`)
   }
-
-  var root = el('div', KEY)
-  var style = document.createElement('style')
-  style.textContent = CSS
-
-  /* ---- preview console (unchanged behaviour) ---- */
-  var launcher = null, consoleBtn = null, panel = null
-  var mode = 'off', panelOpen = false, launcherPos = null, panelPos = null, drag = null
-  var previewReady = false // the aix preview --dev server is up and its URL is known
-
-  function baseLauncherStyle() {
-    return launcherPos ? 'left:' + launcherPos.x + 'px;top:' + launcherPos.y + 'px;bottom:auto;' : 'left:16px;bottom:16px;'
-  }
-  function ensurePanelPos() {
-    if (panelPos) return
-    var x = 160, y = 48
-    try { if (document.documentElement) x = Math.max(16, Math.round((document.documentElement.clientWidth - 1200) / 2)) } catch (e) {}
-    panelPos = { x: x, y: y }
-  }
-  function clampToViewport(x, y, w, h) {
-    var vw = 1280, vh = 720
-    try { if (document.documentElement) { vw = document.documentElement.clientWidth; vh = document.documentElement.clientHeight } } catch (e) {}
-    return { x: Math.max(4, Math.min(x, vw - (w || 46) - 4)), y: Math.max(4, Math.min(y, vh - (h || 46) - 4)) }
-  }
-  var dragEl = null
-  var pendingClick = null
-  function startDrag(e, target) {
-    if (e.button !== 0) return
-    var rect = e.currentTarget.getBoundingClientRect()
-    dragEl = e.currentTarget
-    drag = { target: target, px: e.clientX, py: e.clientY, x: rect.left, y: rect.top, w: rect.width, h: rect.height, moved: false }
-    if (dragEl.setPointerCapture) { try { dragEl.setPointerCapture(e.pointerId) } catch (err) {} }
-    // Document-level tracking: dragging must follow the pointer even if the
-    // capture or the element's own move events misbehave.
-    document.addEventListener('pointermove', docMove, true)
-    document.addEventListener('pointerup', docUp, true)
-    document.addEventListener('pointercancel', docUp, true)
-  }
-  function docMove(e) {
-    if (!drag) return
-    var dx = e.clientX - drag.px, dy = e.clientY - drag.py
-    var moved = drag.moved || Math.abs(dx) > 4 || Math.abs(dy) > 4
-    if (!moved) return
-    if (drag.target === 'panel') {
-      panelPos = { x: drag.x + dx, y: drag.y + dy }
-      if (panel) { panel.style.left = panelPos.x + 'px'; panel.style.top = panelPos.y + 'px' }
-    } else if (drag.target === 'launcher') {
-      launcherPos = clampToViewport(drag.x + dx, drag.y + dy, drag.w, drag.h)
-      var b = launcher || consoleBtn
-      if (b) { b.style.left = launcherPos.x + 'px'; b.style.top = launcherPos.y + 'px'; b.style.bottom = 'auto' }
-    } else if (drag.target === 'src') {
-      srcPos = { x: drag.x + dx, y: drag.y + dy }
-      if (srcWin) { srcWin.style.left = srcPos.x + 'px'; srcWin.style.top = srcPos.y + 'px' }
-    }
-    if (!drag.moved) drag.moved = true
-  }
-  function docUp(e) {
-    document.removeEventListener('pointermove', docMove, true)
-    document.removeEventListener('pointerup', docUp, true)
-    document.removeEventListener('pointercancel', docUp, true)
-    var wasMoved = drag ? drag.moved : true
-    var action = pendingClick
-    pendingClick = null
-    if (dragEl && dragEl.releasePointerCapture) { try { dragEl.releasePointerCapture(e.pointerId) } catch (err) {} }
-    dragEl = null
-    drag = null
-    if (!wasMoved && action) action()
-  }
-
-  function renderPreviewConsole() {
-    if (root.querySelector('#dsh-aiui-launcher')) root.querySelector('#dsh-aiui-launcher').remove()
-    if (root.querySelector('#dsh-aiui-console-btn')) root.querySelector('#dsh-aiui-console-btn').remove()
-    var dim = previewReady ? '' : 'filter:grayscale(1);opacity:.6;'
-    if (mode === 'off') {
-      launcher = el('div', 'dsh-aiui-launcher', baseLauncherStyle() + dim)
-      launcher.title = previewReady ? '进入 AIUI 开发模式（可拖动）' : '预览服务启动中…'
-      var dot = el('span', 'dsh-aiui-dot')
-      launcher.appendChild(dot)
-      launcher.appendChild(document.createTextNode('AIUI 开发模式'))
-      launcher.addEventListener('pointerdown', function (e) {
-        pendingClick = function () { mode = 'console'; panelOpen = true; renderPreviewConsole() }
-        startDrag(e, 'launcher')
-      })
-      root.appendChild(launcher)
-    } else {
-      consoleBtn = el('div', 'dsh-aiui-console-btn', baseLauncherStyle() + (panelOpen ? 'border-color:#40ff5e;background:rgba(64,255,94,.14);box-shadow:0 0 0 3px rgba(64,255,94,.18), 0 8px 28px rgba(64,255,94,.3);' : '') + dim)
-      consoleBtn.title = previewReady ? (panelOpen ? '收起 Preview（可拖动）' : '打开 Preview（可拖动）') : '预览服务启动中，请稍候…'
-      var term = el('span', 'dsh-aiui-terminal')
-      term.textContent = '>_'
-      consoleBtn.appendChild(term)
-      consoleBtn.addEventListener('pointerdown', function (e) {
-        pendingClick = function () { if (previewReady) { panelOpen = !panelOpen; renderPreviewConsole() } }
-        startDrag(e, 'launcher')
-      })
-      root.appendChild(consoleBtn)
-    }
-    if (panel) { panel.remove(); panel = null }
-    if (mode === 'console' && panelOpen) {
-      ensurePanelPos()
-      panel = el('div', 'dsh-aiui-panel', 'left:' + panelPos.x + 'px;top:' + panelPos.y + 'px;')
-      var head = el('div', 'dsh-aiui-panel-head')
-      var title = el('span', 'dsh-aiui-panel-title')
-      var pd = el('span', 'dsh-aiui-panel-dot')
-      title.appendChild(pd)
-      title.appendChild(document.createTextNode('AIUI 开发控制台'))
-      head.appendChild(title)
-      var actions = el('span', 'dsh-aiui-panel-actions')
-      actions.addEventListener('pointerdown', function (e) { e.stopPropagation() })
-      var open = el('a', 'dsh-aiui-open')
-      open.href = PREVIEW_URL || 'about:blank'; open.target = '_blank'; open.rel = 'noreferrer'; open.textContent = '新窗口 ↗'
-      actions.appendChild(open)
-      var close = el('button', 'dsh-aiui-close')
-      close.type = 'button'; close.textContent = '✕'
-      close.addEventListener('click', function () { panelOpen = false; renderPreviewConsole() })
-      actions.appendChild(close)
-      head.appendChild(actions)
-      head.addEventListener('pointerdown', function (e) { pendingClick = null; startDrag(e, 'panel') })
-      panel.appendChild(head)
-      var frame = el('iframe', 'dsh-aiui-frame')
-      frame.src = PREVIEW_URL || 'about:blank'; frame.title = 'AIUI Preview'
-      panel.appendChild(frame)
-      var foot = el('div', 'dsh-aiui-foot')
-      foot.textContent = 'Ink 浏览器运行时 · 视口 480×352 · 图标与窗口均可拖动'
-      panel.appendChild(foot)
-      root.appendChild(panel)
-    }
-  }
-
-  /* Ensure the live preview dev server is running; remember its URL. */
-  function ensurePreviewReady() {
-    fetch('/api/aiui-preview').then(function (r) { return r.json() }).then(function (resp) {
-      var url = (resp && resp.ok && resp.running && typeof resp.url === 'string') ? resp.url : null
-      var ready = url !== null
-      var changed = url !== PREVIEW_URL || ready !== previewReady
-      PREVIEW_URL = url
-      previewReady = ready
-      if (changed && gateState !== 'off') renderPreviewConsole()
-      if (!ready && gateState !== 'off') setTimeout(ensurePreviewReady, 1500)
-    }).catch(function () { if (gateState !== 'off') setTimeout(ensurePreviewReady, 1500) })
-  }
-
-  /* ---- project panel + source viewer ---- */
-  var projPanel = null, projBody = null, srcWin = null, srcPos = null, srcPath = null, srcPre = null, srcImg = null
-
-  function showProjectPanel() {
-    if (projPanel) return
-    projPanel = el('div', 'dsh-aiui-proj')
-    var head = el('div', 'dsh-aiui-proj-head')
-    var title = el('span', 'dsh-aiui-proj-title')
-    title.textContent = 'AIUI 项目'
-    head.appendChild(title)
-    var refresh = el('button', 'dsh-aiui-proj-btn')
-    refresh.type = 'button'; refresh.textContent = '↻'
-    refresh.title = '刷新目录树'
-    refresh.addEventListener('click', function () { loadProjectTree(true) })
-    head.appendChild(refresh)
-    var selectBtn = el('button', 'dsh-aiui-proj-btn')
-    selectBtn.type = 'button'
-    selectBtn.textContent = '选择项目'
-    selectBtn.title = '选择/切换 AIUI 项目'
-    selectBtn.addEventListener('click', function () { showProjectDialog(true) })
-    head.appendChild(selectBtn)
-    var toggle = el('button', 'dsh-aiui-proj-toggle')
-    toggle.type = 'button'
-    toggle.textContent = '»'
-    toggle.title = '收起目录树'
-    toggle.addEventListener('click', function () { collapseProjectPanel() })
-    head.appendChild(toggle)
-    projPanel.appendChild(head)
-    projBody = el('div', 'dsh-aiui-proj-body')
-    projPanel.appendChild(projBody)
-    root.appendChild(projPanel)
-    loadProjectTree(true)
-  }
-
-  var projCollapsed = false
-  function collapseProjectPanel() {
-    projCollapsed = true
-    if (projPanel) projPanel.style.display = 'none'
-    if (root.querySelector('#dsh-aiui-proj-restore')) return
-    var restore = el('div', 'dsh-aiui-proj-restore')
-    restore.title = '展开目录树'
-    var arrow = document.createElement('span')
-    arrow.textContent = '◀'
-    var label = document.createElement('span')
-    label.textContent = '项目'
-    restore.appendChild(arrow); restore.appendChild(label)
-    restore.addEventListener('click', function () { restoreProjectPanel() })
-    root.appendChild(restore)
-  }
-  function restoreProjectPanel() {
-    projCollapsed = false
-    var restore = root.querySelector('#dsh-aiui-proj-restore')
-    if (restore) restore.remove()
-    if (projPanel) projPanel.style.display = 'flex'
-  }
-
-  function loadProjectTree(first) {
-    if (!projBody) return
-    if (first) projBody.innerHTML = '<div id="dsh-aiui-proj-note">正在读取项目…</div>'
-    fetch('/api/aiui-project').then(function (r) { return r.json() }).then(function (info) {
-      if (info && info.ok && info.project) {
-        var head = projPanel ? projPanel.querySelector('#dsh-aiui-proj-title') : null
-        if (head) head.textContent = info.project.name
-        return fetch('/api/aiui-project-tree').then(function (r) { return r.json() })
-      }
-      return Promise.resolve({ ok: false, error: 'no project' })
-    }).then(function (treeResp) {
-      if (treeResp && treeResp.ok && treeResp.tree) renderTree(treeResp.tree)
-      else if (treeResp && treeResp.error) {
-        if (projBody) projBody.innerHTML = '<div id="dsh-aiui-proj-note">目录树加载失败：' + treeResp.error + '</div>'
-      } else { renderProjectPicker(); showProjectDialog(false) }
-    }).catch(function () {
-      if (projBody) projBody.innerHTML = '<div id="dsh-aiui-proj-note">目录树加载失败，请点击 ↻ 重试或重新选择项目</div>'
-    })
-  }
-
-  /* project picker dialog — appears automatically when no project is set */
-  var dialogTried = false
-  function showProjectDialog(force) {
-    if (dialogTried && !force) return
-    dialogTried = true
-    if (root.querySelector('#dsh-aiui-dlg')) return
-    var dlg = el('div', 'dsh-aiui-dlg')
-    var card = el('div', 'dsh-aiui-dlg-card')
-    var title = document.createElement('h3')
-    title.id = 'dsh-aiui-dlg-title'
-    title.textContent = '选择 AIUI 项目'
-    var sub = document.createElement('div')
-    sub.id = 'dsh-aiui-dlg-sub'
-    sub.textContent = '点击"浏览文件夹…"打开系统目录选择器（所选目录需包含 app.json），或从下方候选项目中选择：'
-    var browse = el('button', 'dsh-aiui-dlg-btn')
-    browse.type = 'button'
-    browse.className = 'primary dsh-aiui-dlg-browse'
-    browse.textContent = '📁 浏览文件夹…'
-    var sep = document.createElement('div')
-    sep.id = 'dsh-aiui-dlg-sep'
-    sep.textContent = '或选择已发现的项目'
-    var list = el('div', 'dsh-aiui-dlg-list')
-    list.textContent = '正在扫描候选项目…'
-    var err = document.createElement('div')
-    err.id = 'dsh-aiui-dlg-err'
-    var actions = el('div', 'dsh-aiui-dlg-actions')
-    var cancel = el('button', 'dsh-aiui-dlg-btn')
-    cancel.type = 'button'; cancel.textContent = '取消'
-    actions.appendChild(cancel)
-    card.appendChild(title); card.appendChild(sub); card.appendChild(browse)
-    card.appendChild(sep); card.appendChild(list); card.appendChild(err); card.appendChild(actions)
-    dlg.appendChild(card)
-    root.appendChild(dlg)
-
-    function setErr(msg) {
-      err.textContent = msg || ''
-      err.style.display = msg ? 'block' : 'none'
-    }
-    function close() {
-      if (dlg.parentNode) dlg.parentNode.removeChild(dlg)
-    }
-    cancel.addEventListener('click', close)
-    function pick(path) {
-      setErr('')
-      fetch('/api/aiui-project-select', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: path }),
-      }).then(function (r) { return r.json() }).then(function (sel) {
-        if (sel && sel.ok) {
-          close()
-          // Ensure the panel exists (hero-stage picks have none yet) and shows the tree right away.
-          if (!projPanel) showProjectPanel()
-          else loadProjectTree(true)
-          if (sel.note) console.log('[aiui-dev-console] project note:', sel.note)
-          ensurePreviewReady()
-        }
-        else {
-          var detail = ''
-          if (sel && sel.checked) detail = '（所选：' + sel.received + '｜检查：' + sel.checked + '）'
-          setErr('选择失败：' + ((sel && sel.error) || '未知错误') + detail)
-        }
-      }).catch(function () { setErr('选择失败：网络错误') })
-    }
-    browse.addEventListener('click', function () {
-      setErr('')
-      browse.disabled = true
-      browse.textContent = '正在打开系统文件夹选择器…'
-      // Drives the harness' own native OS directory chooser (host.pickDirectory).
-      fetch('/api/host.pickDirectory', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          type: 'client-request',
-          rpcId: 'aiui-pick-' + Date.now(),
-          method: 'host.pickDirectory',
-          payload: {},
-        }),
-      }).then(function (r) { return r.json() }).then(function (resp) {
-        var result = resp && resp.result
-        if (result && result.ok) {
-          var path = result.value && result.value.path
-          if (path) pick(path)
-          else setErr('未选择文件夹（已取消）')
-        } else {
-          setErr('系统文件夹选择器返回失败，请重试或从下方候选项目中选择')
-        }
-      }).catch(function () { setErr('系统文件夹选择器不可用，请从下方候选项目中选择') })
-        .finally(function () { browse.disabled = false; browse.textContent = '📁 浏览文件夹…' })
-    })
-    fetch('/api/aiui-projects').then(function (r) { return r.json() }).then(function (resp) {
-      list.innerHTML = ''
-      if (resp && resp.ok && resp.projects && resp.projects.length) {
-        resp.projects.forEach(function (p) {
-          var b = el('button', 'dsh-aiui-dlg-item')
-          b.type = 'button'
-          var ic = document.createElement('span')
-          ic.className = 'dsh-aiui-dlg-ic'
-          ic.textContent = '📁'
-          var name = document.createElement('span')
-          name.textContent = p.name
-          b.appendChild(ic); b.appendChild(name)
-          b.title = p.path
-          b.addEventListener('click', function () { pick(p.path) })
-          list.appendChild(b)
-        })
-      } else {
-        var none = document.createElement('div')
-        none.id = 'dsh-aiui-proj-note'
-        none.textContent = '（未发现 AIUI 项目，请在上方输入项目路径）'
-        list.appendChild(none)
-      }
-    }).catch(function () {
-      list.innerHTML = ''
-      var none = document.createElement('div')
-      none.id = 'dsh-aiui-proj-note'
-      none.textContent = '（项目扫描失败，请在上方输入项目路径）'
-      list.appendChild(none)
-    })
-  }
-
-  function renderProjectPicker() {
-    if (!projBody) return
-    projBody.innerHTML = ''
-    var note = el('div', 'dsh-aiui-proj-note')
-    note.textContent = '尚未选择项目。在对话中告诉助手要开发的 AIUI 项目，或从下方选择：'
-    projBody.appendChild(note)
-    fetch('/api/aiui-projects').then(function (r) { return r.json() }).then(function (resp) {
-      if (!resp || !resp.ok || !resp.projects || !resp.projects.length) {
-        var none = el('div', 'dsh-aiui-proj-note')
-        none.textContent = '（工作区未发现含 app.json 的 AIUI 项目）'
-        projBody.appendChild(none)
-        return
-      }
-      resp.projects.forEach(function (p) {
-        var btn = el('button', 'dsh-aiui-proj-pick')
-        btn.type = 'button'
-        btn.textContent = p.name
-        btn.title = p.path
-        btn.addEventListener('click', function () {
-          fetch('/api/aiui-project-select', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ path: p.path }),
-          }).then(function (r) { return r.json() }).then(function (sel) {
-            if (sel && sel.ok) { loadProjectTree(true); ensurePreviewReady() }
-            else {
-              projBody.innerHTML = '<div id="dsh-aiui-proj-note">选择失败：' + ((sel && sel.error) || '未知错误') + '</div>'
-              setTimeout(function () { loadProjectTree(true) }, 800)
-            }
-          }).catch(function () {
-            projBody.innerHTML = '<div id="dsh-aiui-proj-note">选择失败：网络错误</div>'
-            setTimeout(function () { loadProjectTree(true) }, 800)
-          })
-        })
-        projBody.appendChild(btn)
-      })
-    }).catch(function () {})
-  }
-
-  function renderTree(nodes) {
-    if (!projBody) return
-    projBody.innerHTML = ''
-    if (!nodes || !nodes.length) {
-      var empty = el('div', 'dsh-aiui-proj-note')
-      empty.textContent = '（项目目录为空或没有可显示的文件）'
-      projBody.appendChild(empty)
-      return
-    }
-    var ul = el('ul', 'dsh-aiui-tree')
-    appendNodes(ul, nodes)
-    projBody.appendChild(ul)
-  }
-
-  function appendNodes(ul, nodes) {
-    nodes.forEach(function (node) {
-      var li = document.createElement('li')
-      if (node.type === 'dir') {
-        var dirRow = document.createElement('div')
-        dirRow.className = 'dsh-aiui-dir'
-        var arrow = document.createElement('span')
-        arrow.className = 'dsh-aiui-arrow'
-        arrow.textContent = '▸'
-        var ic = document.createElement('span')
-        ic.className = 'dsh-aiui-ic'
-        ic.textContent = '▣'
-        var name = document.createElement('span')
-        name.textContent = node.name
-        dirRow.appendChild(arrow); dirRow.appendChild(ic); dirRow.appendChild(name)
-        var childUl = document.createElement('ul')
-        childUl.style.display = 'none'
-        if (node.children && node.children.length) appendNodes(childUl, node.children)
-        dirRow.addEventListener('click', function () {
-          var open = childUl.style.display !== 'none'
-          childUl.style.display = open ? 'none' : 'block'
-          arrow.textContent = open ? '▸' : '▾'
-        })
-        li.appendChild(dirRow); li.appendChild(childUl)
-      } else {
-        var fileRow = document.createElement('div')
-        fileRow.className = 'dsh-aiui-file'
-        var ic2 = document.createElement('span')
-        ic2.className = 'dsh-aiui-ic'
-        ic2.textContent = '◈'
-        var name2 = document.createElement('span')
-        name2.textContent = node.name
-        fileRow.appendChild(ic2); fileRow.appendChild(name2)
-        fileRow.addEventListener('click', function () { openSource(node.path, node.name) })
-        li.appendChild(fileRow)
-      }
-      ul.appendChild(li)
-    })
-  }
-
-  function openSource(relPath, name) {
-    if (!srcWin) {
-      srcWin = el('div', 'dsh-aiui-src', 'right:310px;top:60px;left:auto;')
-      var head = el('div', 'dsh-aiui-src-head')
-      head.addEventListener('pointerdown', function (e) { pendingClick = null; startDrag(e, 'src') })
-      srcPath = el('span', 'dsh-aiui-src-path')
-      head.appendChild(srcPath)
-      var actions = el('span', 'dsh-aiui-panel-actions')
-      actions.addEventListener('pointerdown', function (e) { e.stopPropagation() })
-      var close = el('button', 'dsh-aiui-close')
-      close.type = 'button'; close.textContent = '✕'
-      close.addEventListener('click', function () { if (srcWin) { srcWin.remove(); srcWin = null } })
-      actions.appendChild(close)
-      head.appendChild(actions)
-      srcWin.appendChild(head)
-      srcPre = document.createElement('pre')
-      srcPre.id = 'dsh-aiui-src-pre'
-      srcWin.appendChild(srcPre)
-      srcImg = document.createElement('img')
-      srcImg.id = 'dsh-aiui-src-img'
-      srcWin.appendChild(srcImg)
-      root.appendChild(srcWin)
-    }
-    if (srcPath) srcPath.textContent = relPath
-    if (srcPre) srcPre.textContent = '加载中…'
-    if (srcImg) { srcImg.src = ''; srcImg.style.display = 'none' }
-    fetch('/api/aiui-project-file?path=' + encodeURIComponent(relPath))
-      .then(function (r) { return r.json() })
-      .then(function (resp) {
-        if (resp && resp.ok) {
-          if (resp.kind === 'image' && srcImg) {
-            srcImg.src = resp.dataUrl
-            srcImg.style.display = 'block'
-            if (srcPre) srcPre.style.display = 'none'
-          } else {
-            if (srcImg) srcImg.style.display = 'none'
-            if (srcPre) { srcPre.style.display = 'block'; srcPre.textContent = resp.content }
-          }
-        } else {
-          if (srcImg) srcImg.style.display = 'none'
-          if (srcPre) { srcPre.style.display = 'block'; srcPre.textContent = '无法读取：' + ((resp && resp.error) || '未知错误') }
-        }
-      })
-      .catch(function () { if (srcPre) srcPre.textContent = '网络错误' })
-  }
-
-  /* ---- presence gate: the aiui-dev hero chip AND the running session ---- */
-  // Tracks the exact surface ('off' | 'hero' | 'session'), not just a boolean
-  // "is anything shown": the hero→session handoff must re-run the mount branch,
-  // otherwise a plain boolean would early-return and leave the console unmounted.
-  var gateState = 'off'
-  function presetMatches(node) {
-    var text = node ? (node.textContent || '') : ''
-    return text.indexOf(PRESET_TEXT) >= 0 || text.indexOf(PRESET_ID) >= 0
-  }
-  function sync() {
-    var header = document.querySelector('[data-slot="' + HEADER_SLOT + '"]')
-    var hero = document.querySelector('[data-slot="conversation.hero.agentPreset"]')
-    var inSession = presetMatches(header)
-    var inHero = !inSession && presetMatches(hero)
-    var next = inSession ? 'session' : (inHero ? 'hero' : 'off')
-    if (next === gateState) return
-    gateState = next
-    if (next === 'off') {
-      if (root.parentNode) root.parentNode.removeChild(root)
-      return
-    }
-    // Both the hero chip and a running session mount the full console: the
-    // launcher/preview button plus the right-side project tree. The tree
-    // surfaces the project picker on its own when no project is set yet.
-    if (!style.parentNode) document.head.appendChild(style)
-    if (!root.parentNode) document.body.appendChild(root)
-    renderPreviewConsole()
-    showProjectPanel()
-    // Make sure the preview static server (:8765) is running so clicking the
-    // icon opens a working preview.
-    ensurePreviewReady()
-  }
-
-  sync()
-  setTimeout(sync, 300)
-  setTimeout(sync, 1200)
-  new MutationObserver(function () {
-    try { sync() } catch (e) { console.warn('[aiui-dev-console] observer err', e) }
-  }).observe(document.body, { childList: true, subtree: true, characterData: true })
-
-  console.log('[aiui-dev-console] injected; aiui-dev sessions only')
-})()
-`
 }

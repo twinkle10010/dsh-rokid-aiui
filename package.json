@@ -1,7 +1,7 @@
 {
   "name": "dsh-rokid-aiui",
-  "version": "0.1.0",
-  "description": "DeepSeek Harness host plugin: an AIUI dev console with a live aix preview (hot-reload) and a project file tree.",
+  "version": "0.3.0",
+  "description": "DeepSeek Harness Rokid AIUI dev suite: one bundle that installs the AIUI dev console (live aix preview with hot-reload, project tree, fenced project API), the \"AIUI 开发模式\" agent preset as a declaration row, and the vendored aiui-dev / aiui-cloud-integration skills.",
   "type": "module",
   "main": "lib/aiui-dev-console.js",
   "exports": {
@@ -10,19 +10,37 @@
   "files": [
     "lib",
     "src",
+    "client",
+    "preset",
+    "build.mjs",
     "cordis.patch.yml",
+    "preset.patch.yml",
     "README.md",
-    "preset"
+    "LICENSE",
+    "THIRD-PARTY-NOTICES.md"
   ],
   "dsh": {
     "bundle": {
-      "patch": "./cordis.patch.yml"
+      "patch": [
+        "./cordis.patch.yml",
+        "./preset.patch.yml"
+      ]
     }
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/twinkle10010/dsh-rokid-aiui.git"
+  },
+  "homepage": "https://github.com/twinkle10010/dsh-rokid-aiui#readme",
+  "bugs": {
+    "url": "https://github.com/twinkle10010/dsh-rokid-aiui/issues"
+  },
+  "author": "shanlishuo <347841284@qq.com>",
   "scripts": {
     "build": "node build.mjs"
   },
   "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.3",
     "@yodaos-pkg/aix-cli": "^0.8.2"
   },
   "engines": {
@@ -35,5 +53,8 @@
     "aix",
     "preview"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
 }

@@ -1,12 +1,19 @@
 # dsh-rokid-aiui bundle patch — the layer applied when a profile lists this bundle.
 
-# Optional configuration (override in your profile's cordis.patch.yml by id):
+# The row declares no config: every field has a runtime default, so a profile
+# that lists this bundle works untouched. Optional overrides (in the profile's
+# cordis.patch.yml, by id — the whole `config` block is replaced, not merged):
 #   - id: aiui-dev-console
 #     config:
 #       workspaceRoot: 'E:/path/to/your/aiui/projects'   # scanned for app.json dirs
 #       projectFile:  'E:/path/to/current-project.json'  # marker file for the chosen project
 #       aixCli:       'E:/path/to/aix-cli/dist/cli.js'   # override the resolved aix-cli entry
 #       aixCwd:       'E:/path'                          # spawn cwd for the preview dev server
+#       presetLabel:  'AIUI 开发模式'                     # label that activates the console UI
+#       presetId:     'aiui-dev'                         # preset id, matched as a fallback
+#       scanDepth:    3                                  # levels scanned for nested projects
+#       previewStartTimeoutMs: 15000                     # `aix preview --dev` URL deadline
+#       legacyPresetSync: false                          # old $DSH_HOME/.agent-presets format
 - insert:
     - id: aiui-dev-console
       name: 'dsh-rokid-aiui'
